@@ -18,6 +18,17 @@ import { subtask } from "hardhat/config";
 import { TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD } from "hardhat/builtin-tasks/task-names";
 subtask(TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD, async (args: { solcVersion: string }, _hre, runSuper) => {
     if (process.env.AUDIT_LOCAL_SOLC === "1" && args.solcVersion === "0.7.6") {
+        // Only substitute the compiler when the installed npm package really is 0.7.6, so build info never
+        // claims a compiler version that did not produce the bytecode.
+        let installed: string | undefined;
+        try {
+            installed = require("solc/package.json").version;
+        } catch {
+            installed = undefined;
+        }
+        if (installed !== "0.7.6") {
+            throw new Error(`AUDIT_LOCAL_SOLC=1 requires solc@0.7.6 to be installed (found ${installed ?? "none"})`);
+        }
         return {
             compilerPath: require.resolve("solc/soljson.js"),
             isSolcJs: true,
