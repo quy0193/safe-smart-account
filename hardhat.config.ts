@@ -11,6 +11,23 @@ import "./src/tasks/local_verify";
 import "./src/tasks/deploy_contracts";
 import "./src/tasks/show_codesize";
 
+// Opt-in escape hatch for sandboxed environments that cannot reach binaries.soliditylang.org:
+// with `AUDIT_LOCAL_SOLC=1` and `solc@0.7.6` installed (`npm i --no-save solc@0.7.6`), serve the
+// 0.7.6 compiler from the npm package instead of downloading it. Inert unless explicitly enabled.
+import { subtask } from "hardhat/config";
+import { TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD } from "hardhat/builtin-tasks/task-names";
+subtask(TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD, async (args: { solcVersion: string }, _hre, runSuper) => {
+    if (process.env.AUDIT_LOCAL_SOLC === "1" && args.solcVersion === "0.7.6") {
+        return {
+            compilerPath: require.resolve("solc/soljson.js"),
+            isSolcJs: true,
+            version: "0.7.6",
+            longVersion: "0.7.6+commit.7338295f",
+        };
+    }
+    return runSuper();
+});
+
 const argv = yargs(hideBin(process.argv))
     .option("network", {
         type: "string",
