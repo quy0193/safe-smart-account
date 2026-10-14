@@ -1,0 +1,452 @@
+[
+ {
+  "id": "F01",
+  "title": "ReentrancyTransactionGuard lock can be cleared or set by anyone (no caller authorization), defeating the reentrancy protection",
+  "severity": "medium",
+  "category": "access-control / reentrancy-guard-bypass",
+  "file": "contracts/examples/guards/ReentrancyTransactionGuard.sol",
+  "line": 66,
+  "description": "The guard keeps one boolean in its own storage (GUARD_STORAGE_SLOT, ReentrancyTransactionGuard.sol:12, read via getGuard() at :29-37). checkTransaction (:43-60) does `require(!guard.active); guard.active = true;` and checkAfterExecution (:66-68) does `getGuard().active = false;` and checkModuleTransaction/checkAfterModuleExecution (:78-98) do the same on the same slot. None of the four functions checks msg.sender (e.g. that the caller is the Safe that configured the guard), so any address can flip the flag at will. Consequence A (bypass): while Safe tx T1 is executing (flag set at Safe.sol:175-190, before execute at :203), the callee of T1 calls guard.checkAfterExecution(0,false) directly, clearing the flag, then re-enters safe.execTransaction with the already-signed next-nonce tx T2 (nonce was pre-incremented at Safe.sol:168, so T2 is valid); checkTransaction now passes. The guard's sole stated purpose (\"Prevents reentrancy into the transaction execution function\", :8) does not hold against any callee. Consequence B (griefing DoS): any EOA can call checkTransaction(...) directly and set the flag; every Safe using that guard instance then reverts in execTransaction with \"Reentrancy detected\" until someone calls checkAfterExecution (also permissionless), so the lock is a per-block race the attacker can keep re-winning for the cost of gas. Both are reproduced by the PoC spec docs/security-review/poc/guards-reentrancy-debug.spec.ts (tests \"a callee can clear the lock and re-enter execTransaction\" and \"anyone can lock the guard\"), which pass against HEAD. Related but distinct: F05 (the flag is a single global slot shared by all Safes using the instance).",
+  "attack_path": "Bypass: 1) Safe S has ReentrancyTransactionGuard G set. 2) Owners have signed T1 (nonce n, to = untrusted contract A, or any call chain that reaches attacker code) and T2 (nonce n+1), e.g. both queued in the Safe transaction service where signatures are public. 3) Relayer executes T1: Safe.sol:168 nonce -> n+1, :170 checkSignatures, :175 G.checkTransaction sets active=true, :203 execute -> A. 4) A calls G.checkAfterExecution(bytes32(0), false) -> active=false (ReentrancyTransactionGuard.sol:67, no caller check). 5) A calls S.execTransaction(T2): signatures valid, G.checkTransaction sees active==false, T2 executes nested inside T1. DoS: attacker EOA calls G.checkTransaction(0,0,\"\",0,0,0,0,0,0,\"\",0) -> active=true; all Safes with guard G revert on execTransaction until G.checkAfterExecution is called by anyone; attacker re-locks after each unlock.",
+  "evidence": "ReentrancyTransactionGuard.sol:57-59 `GuardValue storage guard = getGuard(); require(!guard.active, \"Reentrancy detected\"); guard.active = true;` and :66-68 `function checkAfterExecution(bytes32, bool) external override { getGuard().active = false; }` -- no msg.sender validation anywhere in the contract; GUARD_STORAGE_SLOT at :12 is a single constant slot. Safe.sol:168 (`nonce++` before execution), :175-190 (pre-check), :203 (execute), :226-228 (post-check). PoC: docs/security-review/poc/guards-reentrancy-debug.spec.ts, 'ReentrancyTransactionGuard' tests 1 and 2 (control run without the unlock call reverts with \"Reentrancy detected\"; with the unlock call the nested tx executes: mock.invocationCount()==1, safe.nonce()==n+2).",
+  "recommendation": "Key the flag by the calling Safe and only let the Safe that set it clear it: e.g. `mapping(address => bool) active;` with `require(!active[msg.sender]); active[msg.sender] = true;` in checkTransaction/checkModuleTransaction and `active[msg.sender] = false;` in the after-hooks (so an arbitrary caller can only toggle its own entry, which no Safe reads). Alternatively, store the flag in the Safe's own storage via a delegatecall-based design, or document prominently that this example is not safe to deploy as-is.",
+  "confidence": 0.9,
+  "sources": [
+   "guards"
+  ]
+ },
+ {
+  "id": "F02",
+  "title": "EIP-7702 delegation to the Safe/SafeL2 singleton has no initialization protection: setup() is gated only by threshold == 0, so a delegated-but-not-yet-set-up EOA is claimable by anyone and a relayer-sponsored authorization can be hijacked; acknowledged only in a test-helper comment",
+  "severity": "medium",
+  "category": "initialization / front-running (EIP-7702)",
+  "file": "contracts/Safe.sol",
+  "line": 108,
+  "description": "The 1.5.0 singleton is explicitly designed to be usable as an EIP-7702 delegation target (contracts/common/EIP7702.sol:15-28; contracts/base/OwnerManager.sol:120 allows `owner == address(this)` only when `isThisDelegatedAccount()`; contracts/interfaces/ISafe.sol:58 says a Safe owning itself 'is a valid setup for EIP-7702 delegations'; tests in test/core/Safe.OwnerManager.spec.ts:60-68 and test/core/Safe.Setup.spec.ts:169-186). However the only thing that gates `setup()` (contracts/Safe.sol:108-134, `external`, no caller check) is `if (threshold > 0) revertWithError(\"GS200\")` in `setupOwners` (contracts/base/OwnerManager.sol:49), and `threshold = 1` is written by the constructor only into the singleton's own storage (contracts/Safe.sol:99-103). An EOA that delegates to the singleton starts with `threshold == 0` in its own storage (and `modules[SENTINEL] == 0`, ModuleManager.sol:88-90), so `setup()` is callable by any `msg.sender` with arbitrary owners; nothing in Safe/SafeL2 ties initialization to the EOA (no `msg.sender == address(this)` requirement when `isThisDelegatedAccount()`, no EOA signature over the setup parameters). `isThisDelegatedAccount()` is used nowhere else (grep: only OwnerManager.sol:120). For CREATE2 proxies this is mitigated by the factory's atomic initializer call (contracts/proxies/SafeProxyFactory.sol:66-77), but no equivalent exists for 7702. Unlike a fresh proxy, a 7702 EOA already holds ETH/tokens, so takeover is immediately profitable. The repository's only acknowledgement is a comment in the test helper `getEip7702SafeTemplateWithSingleton` (test/utils/setup.ts:122-124: 'this process is UNSAFE and only used for testing ... can be front-run by anyone'); the user-facing natspec (ISafe.sol:57-63) only warns about proxies and presents 7702 as a valid setup, and nothing in docs/overview.md, docs/error_codes.md, CHANGELOG.md or the IOwnerManager natspec warns integrators. Safe's external `safe-eip7702` proxy (commits the setup-data hash into the delegate bytecode) is the known mitigation but is not referenced anywhere in this repo. Severity note for the verifier: the managers lens rated this informational (inherent property of any initializer pattern under EIP-7702; only the non-atomic delegate-then-setup flow considered), while the proxy-setup-migration lens rated it medium because EIP-7702 authorization tuples are not bound to a transaction sender, so even an intended-atomic *sponsored* flow (relayer bundles authorization + setup) is hijackable by a third party who sees the tuple; the merged entry keeps medium as the highest supported severity.",
+  "attack_path": "Sponsored flow: victim EOA signs an EIP-7702 authorization tuple {chainId, Safe singleton, nonce = current EOA nonce} for a relayer to include in a type-4 tx together with `setup([victim],1,...)`. Authorization tuples are not bound to a transaction sender, so an attacker who sees the tuple (mempool, relayer API, shared bundle) submits their own type-4 tx {authorizationList:[tuple], to: victim, data: setup([attacker],1,0,'',0,0,0,0)} with higher priority fee. The delegation is applied and the attacker becomes the sole owner (setupOwners passes because threshold == 0 at OwnerManager.sol:49; setupModules passes because modules[SENTINEL] == 0 at ModuleManager.sol:89); the relayer's tx then fails (stale authorization nonce + GS200). The attacker drains the EOA via execTransaction with their own signature. Non-sponsored but non-atomic flow (delegate in one tx, setup in a later one, exactly what the test helper models) is trivially claimable in the gap: attacker calls `victimEOA.setup([attacker], 1, 0, \"\", 0, 0, 0, 0)` and the victim's later `setup` reverts with GS200. Verified on hardhat: the prior-stage PoC docs/security-review/poc/eip7702-setup-frontrun.spec.ts passes (attacker takes over and drains half the balance), and an additional scratchpad test confirmed the sponsored-authorization hijack: attacker reused the victim's authorization in its own tx, became owner, code at victim == 0xef0100||singleton, and the relayer's subsequent setup reverted.",
+  "evidence": "contracts/Safe.sol:99-103 `constructor() { threshold = 1; }` (singleton storage only); contracts/Safe.sol:108-134 / :117 `function setup(...) external override` with no sender/authority check; contracts/base/OwnerManager.sol:46-53 / :49 `if (threshold > 0) revertWithError(\"GS200\");` is the sole re-init guard; contracts/base/ModuleManager.sol:88-90; contracts/common/EIP7702.sol:15-28 `isThisDelegatedAccount()`; contracts/base/OwnerManager.sol:120 only use of it; contracts/interfaces/ISafe.sol:57-63 natspec; contracts/proxies/SafeProxyFactory.sol:66-77 (atomic initializer for the proxy path only); test/utils/setup.ts:121-134 helper that delegates to the singleton in one tx and calls `setup` in a later one, with the explicit UNSAFE/front-run comment; test/core/Safe.OwnerManager.spec.ts:60-68, test/core/Safe.Setup.spec.ts:169-186. Test runs: `AUDIT_LOCAL_SOLC=1 npx hardhat test docs/security-review/poc/eip7702-setup-frontrun.spec.ts` -> passing; scratchpad test `audit: EIP-7702 sponsored authorization hijack` -> passing.",
+  "recommendation": "At minimum document prominently (ISafe.setup natspec, docs/overview.md, CHANGELOG 1.5.0 section) that the singleton MUST NOT be used as a direct EIP-7702 delegation target unless `setup` is executed atomically in a self-sponsored type-4 transaction (`to = self`, `data = setup(...)`), that relayer-sponsored authorizations are hijackable, and point to the safe-eip7702 proxy (which commits to the setup parameters). Consider an in-code mitigation for delegated accounts, e.g. in `setup()`: `if (isThisDelegatedAccount() && msg.sender != address(this)) revertWithError(...)` (forces the EOA itself to initialise, which closes the sponsored-hijack path), or require an EOA signature over the setup parameters when `isThisDelegatedAccount()`. Optionally keep the existing PoC spec as a regression/documentation test.",
+  "confidence": 0.6,
+  "sources": [
+   "managers",
+   "proxy-setup-migration"
+  ]
+ },
+ {
+  "id": "F03",
+  "title": "DebugTransactionGuard.checkAfterExecution is permissionless and consumes the per-tx nonce record, so any callee can force the enclosing Safe transaction to revert",
+  "severity": "low",
+  "category": "access-control / griefing",
+  "file": "contracts/examples/guards/DebugTransactionGuard.sol",
+  "line": 84,
+  "description": "checkTransaction stores `txNonces[txHash] = nonce` (:76) and checkAfterExecution (:84-89) does `require(nonce != 0, \"Could not get nonce\"); txNonces[txHash] = 0;` with no msg.sender check. The Safe tx hash is public/recomputable: the callee of a Safe transaction knows to=itself, value=msg.value, data=msg.data, operation=CALL, sees the gas params in the pending tx (zero in the common no-refund case) and can call ISafe(msg.sender).getTransactionHash(..., nonce()-1). It then calls guard.checkAfterExecution(txHash, false) directly, zeroing the record; when Safe.sol:227 calls checkAfterExecution for real, the require at :86 fails and the entire execTransaction reverts. Normally a Safe tx with safeTxGas>0 or gasPrice>0 tolerates a failing/malicious callee (Safe.sol:203-223 records ExecutionFailure and still pays the refund, burning the nonce); with this guard installed, any callee gains the ability to abort the outer transaction, unpay the relayer, and keep the nonce unburned, i.e. it converts the Safe's fail-safe semantics into a callee-controlled revert. The contract is labelled \"only meant as a development tool and example\" (:10), hence low. Reproduced by PoC test \"a callee can force the whole Safe transaction to revert via permissionless checkAfterExecution\".",
+  "attack_path": "1) Safe S has DebugTransactionGuard G. 2) Owners sign T (to = contract C controlled by a third party, e.g. a token with hooks, a DEX, any integration). 3) execTransaction(T): Safe.sol:175 G.checkTransaction -> txNonces[H]=n (DebugTransactionGuard.sol:76). 4) execute -> C computes H via ISafe(msg.sender).getTransactionHash(address(this), msg.value, msg.data, 0, <gas params>, ISafe(msg.sender).nonce()-1) and calls G.checkAfterExecution(H,false) -> txNonces[H]=0. 5) Safe.sol:227 G.checkAfterExecution(H, success) -> require(0 != 0) fails -> whole Safe tx reverts regardless of safeTxGas/gasPrice settings.",
+  "evidence": "DebugTransactionGuard.sol:84-89: `function checkAfterExecution(bytes32 txHash, bool success) external override { uint256 nonce = txNonces[txHash]; require(nonce != 0, \"Could not get nonce\"); txNonces[txHash] = 0; emit GasUsage(...); }` -- no caller check. PoC: docs/security-review/poc/guards-reentrancy-debug.spec.ts, DebugTransactionGuard test 1 reverts with \"Could not get nonce\".",
+  "recommendation": "Key txNonces by the Safe (`mapping(address => mapping(bytes32 => uint256))` indexed by msg.sender) so only the Safe that recorded the hash can consume it, or drop the require and the storage round-trip entirely (emit the nonce in the post event by recomputing it from msg.sender.nonce()), since a debug guard should never be able to revert the Safe.",
+  "confidence": 0.9,
+  "sources": [
+   "guards"
+  ]
+ },
+ {
+  "id": "F04",
+  "title": "Regression in 1.5.0 OwnerManager: a legacy self-owner (allowed in Safe <=1.2.0) can no longer be removed or swapped after migrating a non-EIP-7702 Safe to 1.5.0 (GS203), whereas 1.3.0/1.4.1 allowed it",
+  "severity": "low",
+  "category": "migration safety / owner-management DoS",
+  "file": "contracts/base/OwnerManager.sol",
+  "line": 139,
+  "description": "PR #1062 (commit 0227664, 'Prevent Self-Ownership for Non-EIP-7702 Safes') refactored owner validation so that `removeOwner` (contracts/base/OwnerManager.sol:89-99, line 93) and `swapOwner` (lines 104-112, line 106) both call `requireCanRemoveOwner` (lines 139-143), which calls `requireIsValidOwner(owner)` (lines 118-122). `requireIsValidOwner` reverts with GS203 when `owner == address(this) && !isThisDelegatedAccount()`. Before #1062 the removal check was only `owner != 0 && owner != SENTINEL` (see `git show 0227664 -- contracts/base/OwnerManager.sol`), and 1.3.0/1.4.1 likewise did not reject `address(this)` as the owner being removed. Safe 1.1.1 and 1.2.0 did not prevent a Safe from being added as its own owner. Consequently, a legacy Safe that lists itself as an owner and migrates to 1.5.0 (via `changeMasterCopy` for 1.1.1/1.2.0, or via contracts/libraries/SafeMigration.sol for any later version that inherited the config) is left with a permanently un-removable, un-swappable phantom owner: it cannot sign (it is a proxy, not a 7702 EOA), it counts toward `ownerCount`, and it can never be cleaned up. The intent of #1062 was to block *adding* a non-7702 self-owner; blocking *removal* of a pre-existing one is the opposite of what a footgun-fix should do. Not a fund-loss issue (no privilege escalation: `v==1` self-approval needs `msg.sender == Safe`, which already requires an authorised Safe tx, and CompatibilityFallbackHandler.sol:83 passes executor `address(0)`), but a concrete migration regression that the migration test-suite (test/migration/*) does not cover because it only migrates Safes with a single EOA owner.",
+  "attack_path": "Not attacker-driven; correctness/DoS of owner management. Reproduction (verified with a scratchpad hardhat test against the repo's shipped 1.1.1/1.2.0/1.4.1 bytecode in test/json/safeDeployment.json): (1) deploy a 1.1.1 proxy and `setup([user1, proxy], 1, ...)` -> succeeds, `isOwner(proxy) == true`; (2) upgrade to the 1.5.0 singleton via `changeMasterCopy`; (3) `removeOwner(user1, proxy, 1)` and `swapOwner(user1, proxy, user2)` executed as Safe transactions both revert with GS203; `addOwnerWithThreshold(user2,1)` still works. (4) Same legacy Safe upgraded to 1.4.1 instead: `removeOwner(user1, proxy, 1)` succeeds. 1.2.0 also accepts the self-owner at setup.",
+  "evidence": "contracts/base/OwnerManager.sol:93 `requireCanRemoveOwner(prevOwner, owner);` in removeOwner; :106 `requireCanRemoveOwner(prevOwner, oldOwner);` in swapOwner; :139-143 `requireCanRemoveOwner` -> `requireIsValidOwner(owner)`; :118-122 `if (owner == address(0) || owner == SENTINEL_OWNERS || (owner == address(this) && !isThisDelegatedAccount())) revertWithError(\"GS203\");`. Pre-#1062 code (git show 0227664): removeOwner had `if (owner == address(0) || owner == SENTINEL_OWNERS) revertWithError(\"GS203\");` and swapOwner checked `address(this)` only for `newOwner`. Scratchpad test output: '1.1.1 allows the Safe to be its own owner; after upgrade to 1.5.0 the self-owner cannot be removed/swapped' PASS; '1.4.1 (for comparison) allows removing a legacy self-owner' PASS; '1.2.0 also allows self-owner (sanity)' PASS.",
+  "recommendation": "In `requireCanRemoveOwner`, do not apply the `address(this)` restriction to the owner being removed; keep only the null/sentinel check plus the linked-list consistency check (as pre-#1062 and as in 1.3.0/1.4.1), e.g. `if (owner == address(0) || owner == SENTINEL_OWNERS) revertWithError(\"GS203\"); if (owners[prevOwner] != owner) revertWithError(\"GS205\");`. Add a migration test that upgrades a <=1.2.0 Safe with a self-owner and asserts the self-owner can be removed. If the behaviour is intentionally kept, document it in the migration notes/CHANGELOG.",
+  "confidence": 0.85,
+  "sources": [
+   "proxy-setup-migration"
+  ]
+ },
+ {
+  "id": "F05",
+  "title": "ReentrancyTransactionGuard flag is global per guard deployment (not per Safe); a shared deployment blocks legitimate nested cross-Safe execution and NatSpec describes the slot incorrectly",
+  "severity": "low",
+  "category": "design / shared-state",
+  "file": "contracts/examples/guards/ReentrancyTransactionGuard.sol",
+  "line": 12,
+  "description": "The in-flight flag lives at the constant slot keccak256(\"reentrancy_guard.guard.struct\") in the guard contract's storage (:12, :29-37). It is not keyed by msg.sender (the Safe) and the same slot is used by both the transaction-guard path (:57-59) and the module-guard path (:87-89). The NatSpec at :26 claims the value \"is stored in a slot that is unique to the contract instance and the function in which it is called\", which is wrong on the second point (both functions share one slot) and misleading on the first (there is nothing per-Safe). Nothing in the contract, tests, or docs says one instance must be deployed per Safe; the contract has no constructor and looks like a singleton. If two Safes share one instance, a perfectly legitimate flow where Safe A executes a transaction whose target is Safe B's execTransaction (common when A is an owner/operator of B) reverts with \"Reentrancy detected\" because A's pre-check set the global flag. This also means the griefing in F01 affects every Safe sharing the deployment at once. Reproduced by PoC test \"a shared guard deployment blocks legitimate nested Safe-calls-Safe execution\". Related but distinct from F01 (missing caller authorization); the same fix (key by msg.sender) resolves both.",
+  "attack_path": "Operational, not attacker-driven: Safe A and Safe B both set the same ReentrancyTransactionGuard instance. Owners sign T_B for B (nonce nB) and T_A for A (nonce nA, to = B, data = B.execTransaction(T_B, sigs)). Executing T_A: Safe.sol:175 -> G.checkTransaction sets active=true; execute -> B.execTransaction -> Safe.sol:175 -> G.checkTransaction -> require(!active) fails -> whole T_A reverts. Combined with F01, one attacker lock call halts all Safes on the shared instance simultaneously.",
+  "evidence": "ReentrancyTransactionGuard.sol:12 `bytes32 internal constant GUARD_STORAGE_SLOT = keccak256(\"reentrancy_guard.guard.struct\");`, :26 NatSpec claim, :57-59 and :87-89 both operate on getGuard() with the same slot. PoC: docs/security-review/poc/guards-reentrancy-debug.spec.ts test 3 reverts with \"Reentrancy detected\" for distinct Safes A and B.",
+  "recommendation": "Key the flag by msg.sender (the Safe) as in F01, which makes a single deployment safe to share and keeps nested distinct-Safe flows working. Fix the NatSpec at :26 to describe the actual layout. If per-Safe deployment is the intended model, state that in the contract header and in docs/overview.md.",
+  "confidence": 0.85,
+  "sources": [
+   "guards"
+  ]
+ },
+ {
+  "id": "F06",
+  "title": "local-verify never fails the deploy pipeline: bytecode mismatch is only printed, then Sourcify/Etherscan verification proceeds",
+  "severity": "low",
+  "category": "deployment-pipeline-robustness",
+  "file": "src/tasks/local_verify.ts",
+  "line": 41,
+  "description": "`local-verify` is the only step in the deployment pipeline that compares on-chain code with the locally compiled artifact. It computes `verifySuccess = onChainHash === localHash ? \"SUCCESS\" : \"FAILURE\"` (src/tasks/local_verify.ts:41) and then only `console.log`s the result (line 42). It never throws, never sets `process.exitCode`, and returns normally. The composite task `deploy-contracts` (src/tasks/deploy_contracts.ts:4-7) runs `deploy` -> `local-verify` -> `sourcify` -> `etherscan-verify` sequentially with no inspection of the result, so a FAILURE line is buried in a long hardhat-deploy log while the pipeline continues to publish sources for the mismatching deployment. Note also that hardhat-deploy's deterministic path (`fetchIfDifferent`, node_modules/hardhat-deploy/dist/src/helpers.js:494-506) treats any non-empty code at the CREATE2 address as 'already deployed' and writes the deployment file without checking the code, so `local-verify` is the only code check in the flow. (README.md:65-73 even documents `local-verify` as the final step, but the code runs it before the verification uploads.)",
+  "attack_path": "Not attacker-triggered; operational. Example: an operator deploys on a chain whose CREATE2/factory behaviour deviates (or with a corrupted/stale local `deployments/<network>/*.json` whose `address` no longer holds the expected code). `npm run deploy-all <network>` prints `Verification status for Safe: FAILURE` once among hundreds of log lines and then successfully runs `sourcify`/`etherscan-verify`; the operator sees a green final step and submits the addresses to safe-deployments.",
+  "evidence": "src/tasks/local_verify.ts:41-42: `const verifySuccess = onchainBytecodeHash === localBytecodeHash ? \"SUCCESS\" : \"FAILURE\"; console.log(...)` with no throw/exit code. src/tasks/deploy_contracts.ts:4-7: `await hre.run(\"deploy\"); await hre.run(\"local-verify\"); await hre.run(\"sourcify\"); await hre.run(\"etherscan-verify\", ...)`.",
+  "recommendation": "Collect failures and `throw new Error(...)` (or set `process.exitCode = 1`) at the end of `local-verify` when any contract reports FAILURE, so `deploy-contracts` aborts before `sourcify`/`etherscan-verify`; optionally move `local-verify` after the uploads as the README describes, but still fail the process.",
+  "confidence": 0.7,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F07",
+  "title": "GS010 pre-check margin omits CALL-level charges, so the inner call can receive less than safeTxGas and a submitter can burn a tightly-estimated signed transaction",
+  "severity": "low",
+  "category": "gas-accounting / griefing",
+  "file": "contracts/Safe.sol",
+  "line": 197,
+  "description": "The documented guarantee (docs/safe_tx_gas.md:21 and :39, and the code comment at Safe.sol:194-196) is that once the GS010 check passes, the inner call receives at least `safeTxGas`, so the relayer/submitter cannot influence whether a refund-mode transaction succeeds. The check `gasleft() >= max(safeTxGas*64/63, safeTxGas+2500) + 500` only budgets 500 gas for \"code until the execution\" plus the EIP-150 1/64 retention. It does not budget the gas the EVM charges to the *caller* at the CALL/DELEGATECALL opcode itself (Executor.sol:33/40) before the 63/64 rule is applied: cold account access of `to` (2600, EIP-2929), value transfer (9000 when value>0), new-account creation (25000 when value>0 and `to` is empty), nor the calldata->memory copy of `data` performed at the `execute(...)` call site (Safe.sol:203, ~3 gas per 32-byte word). With g' = gas remaining after those charges, the callee gets min(safeTxGas, g' - g'/64). If the submitter sets the outer gas limit so that gasleft at line 197 is just the threshold T = safeTxGas*64/63 + 500 (for safeTxGas >= 157,500), the callee receives safeTxGas - D where D ~= (63/64)*(C_pre + C_extra - 500) - stipend: ~2.3K for a cold value-less CALL, ~8.8K for a cold CALL with value, ~33K for a cold CALL with value to an empty account, plus ~3 gas/word of `data`. Because a failed inner call with safeTxGas>0 does NOT revert the outer tx (Safe.sol:207 only reverts when safeTxGas==0 && gasPrice==0), the nonce is consumed (Safe.sol:168), `ExecutionFailure` is emitted (Safe.sol:223) and, in refund mode, the submitter is still paid (Safe.sol:220). The outer frame only needs the retained 1/64 (~safeTxGas/63) to cover handlePayment + the event, so the attack is feasible when safeTxGas >~ 63 * post-execution cost (~700K gas for a native refund to the warm tx.origin; ~2-3M with an ERC-20 gasToken; ~150K in no-refund mode where only the LOG2 must fit) AND the signers estimated safeTxGas within D of the real need.",
+  "attack_path": "1) Owners sign a Safe tx with gasPrice>0 (refund mode), safeTxGas=S estimated tightly (e.g. S = exact need, as eth_estimateGas on the inner call yields), to a contract not otherwise warmed in the tx, optionally with value>0. 2) A relayer (or in no-refund mode, anyone holding the public signatures) submits execTransaction with a gasLimit chosen so that gasleft() at Safe.sol:197 is just >= S*64/63 + 500 (the GS010 threshold). 3) At Executor.sol:40 the EVM first charges 2600 (+9000 [+25000]) to the Safe's frame, then forwards min(S, 63/64 of the remainder) = S - D; the callee runs out of gas and reverts. 4) success=false; since S>0 the outer tx continues: nonce has been consumed, handlePayment pays the relayer (gasUsed + baseGas) * gasPrice from the Safe, ExecutionFailure is emitted. The signed transaction is burned and must be re-signed, contrary to the documented 'relayer cannot influence the outcome' property. Requires S large enough that the retained S/63 covers the refund+event, and an estimate within D of the true need.",
+  "evidence": "Safe.sol:197: `if (gasleft() < ((safeTxGas << 6) / 63).max(safeTxGas + 2500) + 500) revertWithError(\"GS010\");`  Safe.sol:194-196 comment: \"some to perform code until the execution (500). We also include the 1/64 in the check ... to counteract potential shortings because of EIP-150.\"  Safe.sol:203: `success = execute(to, value, data, operation, gasPrice == 0 ? (gasleft() - 2500) : safeTxGas);` (calldata `data` is copied to memory here, after the check).  Executor.sol:40: `success := call(txGas, to, value, add(data, 0x20), mload(data), 0, 0)` -- EVM charges access/value/new-account cost to the caller before applying the 63/64 cap to txGas.  Safe.sol:207 `if (!success && safeTxGas == 0 && gasPrice == 0)` -- failure with safeTxGas>0 does not revert; nonce incremented at Safe.sol:168; refund at :220; event at :223.  docs/safe_tx_gas.md:21: \"the Safe contract will use the gas specified by the safeTxGas ... This is important to prevent that the relayer can increase the amount of gas used\"; :39: \"safeTxGas behaves like a 'minimum' gas value that needs to be available when it is set to a value > 0\". Existing test test/core/Safe.Execution.spec.ts:226-260 even notes (line 257 FIXME) that gas used around the boundary is 'slightly higher than the safeTxGas', but no test exercises the starvation boundary.",
+  "recommendation": "Make the pre-check account for the charges the CALL opcode levies on the caller: e.g. compute `required = max(safeTxGas*64/63, safeTxGas+2500) + 500 + 2600 + (operation == Call && value > 0 ? 34000 : 0) + 3 * ((data.length + 31) / 32)` (or move the gasleft() check to immediately before the CALL inside execute and compare against `safeTxGas*64/63 + extras`). Alternatively, in refund mode, treat an inner failure as a hard revert when the forwarded gas could not have reached safeTxGas. At minimum, document in docs/safe_tx_gas.md that signers must add a buffer of ~2.6K (no value) / ~9K (value) / ~34K (value to a fresh account) plus 3 gas per word of `data` on top of the callee's estimate, and add a boundary test that drives gasleft at line 197 to exactly the threshold with a cold `to` and asserts the callee observed >= safeTxGas.",
+  "confidence": 0.55,
+  "sources": [
+   "gas-refund"
+  ]
+ },
+ {
+  "id": "F08",
+  "title": "No guard that a live deployment uses the canonical compiler settings; local-verify is self-referential so a non-canonical build still verifies as SUCCESS",
+  "severity": "low",
+  "category": "deterministic-deployment",
+  "file": "hardhat.config.ts",
+  "line": 97,
+  "description": "The compiler list is built from environment variables: `{ version: SOLIDITY_VERSION ?? \"0.7.6\", settings: soliditySettings }` where `soliditySettings = JSON.parse(SOLIDITY_SETTINGS)` (hardhat.config.ts:69, 97-102). Hardhat picks the first config whose version matches (node_modules/hardhat/internal/solidity/compilation-job.js:173-177), so a `SOLIDITY_SETTINGS` value alone (even with SOLIDITY_VERSION unset) replaces the canonical `optimizer: disabled` build. `.env.sample:15-16` explicitly tells developers to put `SOLIDITY_SETTINGS='{\"viaIR\":true,\"optimizer\":{\"enabled\":true,...}}'` in `.env` for coverage runs, and the same `.env` is read by `npm run deploy-all` (dotenv.config at hardhat.config.ts:40; hardhat-deploy's `deploy` task compiles first, node_modules/hardhat-deploy/dist/src/index.js:394-395). None of the deploy scripts (src/deploy/*.ts) nor the `deploy-contracts` task checks the resulting CREATE2 addresses against the CHANGELOG table or asserts `optimizer.enabled === false`. `local-verify` cannot catch this either: it re-compiles using the `settings` taken from the deployment's own metadata (src/tasks/local_verify.ts:9-27), so an optimized build at a non-canonical address verifies as SUCCESS. The pipeline itself was confirmed sound: rebuilding the v1.5.0 commit (dc437e8) with this environment's solc 0.7.6 and salt 0 / factory 0x914d7Fec... reproduces all 13 CHANGELOG addresses exactly, so the only way to get wrong addresses is wrong sources or wrong settings, and the latter has no guard.",
+  "attack_path": "Operational foot-gun, not attacker-triggered: a developer runs coverage per `.env.sample` (SOLIDITY_SETTINGS set in `.env`), later runs `npm run deploy-all custom` on a new chain. Hardhat compiles an optimized/viaIR Safe, hardhat-deploy deploys it deterministically to a different CREATE2 address, `local-verify` prints SUCCESS, Etherscan verification succeeds, and a non-canonical 'Safe v1.5.0' singleton set exists on that chain and may be submitted to safe-deployments.",
+  "evidence": "hardhat.config.ts:69 `const soliditySettings = SOLIDITY_SETTINGS ? JSON.parse(SOLIDITY_SETTINGS) : undefined;` and :98-101 `compilers: [{ version: SOLIDITY_VERSION ?? DEFAULT_SOLIDITY_VERSION, settings: soliditySettings }, { version: DEFAULT_SOLIDITY_VERSION }]`. .env.sample:15-16 recommends optimizer/viaIR settings for coverage. src/tasks/local_verify.ts:9 `const meta = JSON.parse(deployment.metadata!)` and :27 `solcjs.compile(JSON.stringify(meta))` (settings from the deployment itself). Empirical: v1.5.0 tag rebuilt here -> Safe 0xFf51A5898e281Db6DfC7855790607438dF2ca44b, SafeL2 0xEdd160fE..., SafeMigration 0x6439e7AB... all MATCH CHANGELOG.md:29-61.",
+  "recommendation": "In `deploy-contracts` (or a pre-deploy check) refuse to run against a non-local network when `SOLIDITY_VERSION`/`SOLIDITY_SETTINGS` are set or when the active compiler config is not `0.7.6` with optimizer disabled; additionally compare the computed CREATE2 addresses of the artifacts with an expected-address table (as the CHANGELOG already provides) and abort on mismatch.",
+  "confidence": 0.55,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F09",
+  "title": "docs/signatures.md does not document the v == 2 secp256r1 (RIP-7212/EIP-7951) signature encoding added in 1.5.0",
+  "severity": "informational",
+  "category": "documentation",
+  "file": "docs/signatures.md",
+  "line": 13,
+  "description": "docs/signatures.md is the canonical description of the packed signature format (\"Each signature has a constant length of 65 bytes ...\"). It enumerates only ECDSA (`31 > signature type > 26`, line 15), eth_sign (`> 30`, line 27), contract signatures (`== 0`, line 39) and pre-validated (`== 1`, line 61). The implementation in contracts/Safe.sol:354-396 also accepts a fifth branch, `v == 2` (secp256r1), whose constant part is `{32-byte owner}{32-byte data pointer}{0x02}` (`r` = owner address, `s` = pointer) and whose dynamic part is a fixed 128-byte `{r}{s}{qx}{qy}` block *without* a length prefix (unlike the contract-signature dynamic part), and whose owner address is defined as `keccak256(qx || qy)[12:]` (Safe.sol:393). Malleability (no low-s enforcement) is likewise not stated. None of this is in the spec; the only description is a code comment and the tests, and docs/error_codes.md:50-55 mentions GS027/GS028 but not the byte layout. Integrators that parse/validate `signatures` bytes from the spec (guards, relayers, indexers, simulators, nested-Safe tooling) will treat v == 2 as an invalid/ECDSA type, mis-split the dynamic region (e.g. read it as a length-prefixed contract signature) or mis-attribute signers. See also F13, which records this as one of several post-audit changes missing from CHANGELOG/docs.",
+  "attack_path": "No on-chain attack path; the contract code is authoritative and strict (GS021/GS027/GS028). Correctness/robustness gap only: an off-chain or guard-side parser written against docs/signatures.md will misinterpret the 128-byte secp256r1 dynamic part and could reject valid transactions or mis-attribute signers in UIs/simulations.",
+  "evidence": "docs/signatures.md:13-69 lists only four types (0, 1, 27-30, >30). contracts/Safe.sol:354-368: `} else if (v == 2) { ... currentOwner = address(uint160(uint256(r))); ... if (uint256(s) < requiredSignatures.mul(65)) revertWithError(\"GS021\"); if (uint256(s).add(128) > signatures.length) revertWithError(\"GS027\");`; lines 381-393 read `r, s, qx, qy` from `signatures + s + 0x20` with no length word, and :393 `signerAddress := keccak256(add(sig, 0x40), 0x40)`. docs/error_codes.md:50-55 mentions GS027/GS028 but not the byte layout.",
+  "recommendation": "Add a `secp256r1 signature (signature type == 2)` section to docs/signatures.md describing the constant part `{32-bytes owner address}{32-bytes data position}{0x02}`, the fixed 128-byte unprefixed dynamic part `{r}{s}{qx}{qy}`, the owner-address derivation `keccak256(qx||qy)[12:]` (owner must equal the last 20 bytes), and the accepted malleability (no low-s enforcement), mirroring the code comment at Safe.sol:355-360.",
+  "confidence": 0.9,
+  "sources": [
+   "core-sig",
+   "cross-cutting-replay"
+  ]
+ },
+ {
+  "id": "F10",
+  "title": "MultiSend / MultiSendCallOnly: invalid operation byte reverts with stale returndata of the previous sub-call",
+  "severity": "informational",
+  "category": "correctness/robustness",
+  "file": "contracts/libraries/MultiSend.sol",
+  "line": 69,
+  "description": "In both batch libraries the `switch operation` has only `case 0` / `case 1` (MultiSend.sol:62-68, MultiSendCallOnly.sol:53-60); for any other operation byte `success` stays 0 and the generic failure path runs: `returndatacopy(ptr, 0, returndatasize()); revert(ptr, returndatasize())` (MultiSend.sol:69-73, MultiSendCallOnly.sol:61-65). `returndatasize()` at that point is NOT empty: it is the return data of the previous *successful* sub-call in the same batch, because the EVM returndata buffer is only replaced by the next CALL/DELEGATECALL. The batch therefore reverts with an unrelated payload. Confirmed with a PoC (docs/security-review/poc/libraries-parsing-edgecases.spec.ts, test 'invalid operation reverts with the *previous* sub-call's return data'): entry 1 is a successful CALL whose return bytes are `abi.encodeWithSignature(\"Error(string)\",\"NOT A REVERT\")`, entry 2 has operation=2; the delegatecall reverts with `Error(\"NOT A REVERT\")` although nothing reverted. Only the single-entry case (covered by the existing test 'Should fail when using invalid operation', which expects `revertedWithoutReason`) yields empty revert data. Atomicity is preserved (the batch always reverts), so there is no fund-safety impact; the issue is a misleading revert reason that can send tooling/simulators (which decode `Error(string)`/custom errors) and users down the wrong path, and it was not noticed because the existing test only covers the first-entry case.",
+  "attack_path": "No attacker path: the batch payload is owner-signed and the outcome is a revert either way. Robustness only: a batch with [successful call returning bytes X][entry with op >= 2] reverts with X, misattributing the failure.",
+  "evidence": "contracts/libraries/MultiSend.sol:61-73 (`let success := 0`, switch without default, failure path copies `returndatasize()` which still holds the previous sub-call's output); contracts/libraries/MultiSendCallOnly.sol:52-65 identical structure. PoC passes: 6 passing in docs/security-review/poc/libraries-parsing-edgecases.spec.ts.",
+  "recommendation": "Add a `default { revert(0, 0) }` branch to the `switch operation` (one line, no gas impact on the happy path) so an unsupported operation reverts with empty data, and extend test/libraries/MultiSend*.spec.ts with a two-entry case (successful call followed by op=2) asserting `revertedWithoutReason`.",
+  "confidence": 0.9,
+  "sources": [
+   "libraries"
+  ]
+ },
+ {
+  "id": "F11",
+  "title": "MultiSend packed parser has no bounds validation: loop bound is header-offset vs header-less length, over-long dataLength is zero-filled, short trailing bytes are silently ignored",
+  "severity": "informational",
+  "category": "input-validation",
+  "file": "contracts/libraries/MultiSend.sol",
+  "line": 43,
+  "description": "`let length := mload(transactions)` is the byte length of the payload, but the cursor `i` starts at 0x20 (MultiSend.sol:40) and the loop condition is `lt(i, length)` (MultiSend.sol:43; MultiSendCallOnly.sol:34), i.e. a header-inclusive offset is compared against a header-exclusive length. The bound is effectively off by 32 bytes; this is masked only because every entry is at least 85 bytes (MultiSend.sol:60,75), so a well-formed last entry always starts at `i <= length - 53 < length`. Consequences verified with the PoC in docs/security-review/poc/libraries-parsing-edgecases.spec.ts: (1) `dataLength` (MultiSend.sol:58) is never checked against the remaining bytes; a declared length that overshoots the array reads memory past the ABI-decoded `bytes` which, in the fresh DELEGATECALL frame, is all zero (the 0.7.6 calldata-to-memory decoder zero-terminates and nothing in the loop writes memory on the success path: all sub-calls use `out=0,outsize=0`). The target thus receives the real bytes followed by zero padding (test: 4 provided bytes, 68 declared, callee saw 68 bytes = 0xdeadbeef||64 zero bytes). No garbage can be executed. (2) 1..31 trailing bytes after the last well-formed entry are silently dropped because `i >= length` exits the loop. (3) 33..84 trailing bytes are parsed as a truncated entry whose missing fields read as zero (op 0, value 0, dataLength 0; `to` possibly partially present and, if zero, remapped to `address(this)` at MultiSend.sol:54 so the Safe calls its own `receive()`). (4) A `dataLength` large enough to wrap the cursor `i := add(i, add(0x55, dataLength))` (MultiSend.sol:75) cannot survive: the CALL/DELEGATECALL with that `argsSize` triggers unbounded memory expansion and runs out of gas before `i` is updated (PoC test passes with 5M gas). Everything here is deterministic over an owner-signed payload, so it is a strictness/robustness observation rather than a vulnerability; the behaviour has been identical since the original Gnosis MultiSend and both 1.5.0 audits had the file in scope (Certora scope list lines 189-190, Ackee 'all Solidity files in contracts').",
+  "attack_path": "None: the packed payload is part of the EIP-712 signed `data`, so an owner quorum would be the only party able to craft a malformed batch, and the effect is bounded (zero padding or dropped bytes). Off-chain decoders that are stricter than the contract could disagree with on-chain execution for malformed batches, which is a UX concern for signers at most.",
+  "evidence": "contracts/libraries/MultiSend.sol:39-43 (length vs i), :58 (dataLength unchecked), :75 (cursor advance); contracts/libraries/MultiSendCallOnly.sol:30-34, :49, :67. PoC: tests 'over-long dataLength reads zero-filled memory...', 'trailing bytes shorter than 32 are silently ignored...', 'huge dataLength cannot wrap the cursor...' all pass.",
+  "recommendation": "If stricter parsing is ever desired: compute `let end := add(0x20, length)`, loop while `lt(i, end)`, and `require(lte(add(i, add(0x55, dataLength)), end))` per entry (reverting on truncated entries and trailing bytes). Otherwise document the lenient behaviour in the NatSpec so decoders (SDK/UI/guards) mirror it exactly.",
+  "confidence": 0.9,
+  "sources": [
+   "libraries"
+  ]
+ },
+ {
+  "id": "F12",
+  "title": "DebugTransactionGuard uses nonce 0 as its 'not recorded' sentinel, so a Safe transaction at nonce 0 always reverts when the guard is installed without consuming a nonce",
+  "severity": "informational",
+  "category": "correctness / sentinel-collision",
+  "file": "contracts/examples/guards/DebugTransactionGuard.sol",
+  "line": 86,
+  "description": "checkTransaction computes `nonce = safe.nonce() - 1` (:72; the Safe already incremented at Safe.sol:168) and stores it (:76). checkAfterExecution treats 0 as 'missing' (:86). For the Safe's first transaction nonce==0, so the record is 0 and the post-check reverts with \"Could not get nonce\". In the usual flow this is unreachable because installing the guard via execTransaction consumes nonce 0 and the cached `guard` at Safe.sol:172 (read before execution) means the installing tx itself is not checked; but the guard can be installed without consuming a nonce via a module (execTransactionFromModule -> Safe.setGuard, msg.sender==Safe passes `authorized`) or via a setup-time delegatecall library, after which the Safe's first execTransaction is bricked until the guard is removed through the same non-nonce path. Self-inflicted and limited to a development tool, hence informational; reproduced by PoC test \"nonce 0 collides with the 'not set' sentinel\". Distinct from F03 (permissionless checkAfterExecution) though the same refactor fixes both.",
+  "attack_path": "Not attacker-driven. Owner deploys Safe with setup `to`/`data` enabling module M (nonce stays 0); M calls safe.execTransactionFromModule(safe, 0, setGuard(DebugGuard), CALL); first execTransaction at nonce 0 -> DebugTransactionGuard.sol:72 nonce = 1-1 = 0 -> txNonces[H]=0 -> Safe.sol:227 checkAfterExecution -> require(0 != 0) -> revert.",
+  "evidence": "DebugTransactionGuard.sol:72 `nonce = safe.nonce() - 1;`, :76 `txNonces[txHash] = nonce;`, :86 `require(nonce != 0, \"Could not get nonce\");`. PoC: docs/security-review/poc/guards-reentrancy-debug.spec.ts, DebugTransactionGuard test 2.",
+  "recommendation": "Store nonce+1 (or a separate 'seen' flag) so 0 is never a valid recorded value, or remove the record/require as suggested in F03.",
+  "confidence": 0.9,
+  "sources": [
+   "guards"
+  ]
+ },
+ {
+  "id": "F13",
+  "title": "Post-audit functional changes beyond #1115/#1123 are absent from the 1.5.0 audit reports, the CHANGELOG 'Current version' section and docs/signatures.md",
+  "severity": "informational",
+  "category": "audit-coverage / documentation-consistency",
+  "file": "CHANGELOG.md",
+  "line": 10,
+  "description": "The content diff between the Ackee-audited tree (5d26505, 2025-05-27) and HEAD (`git diff 5d26505 HEAD -- contracts/`) contains, besides #1115 and #1123, several functional changes: (1) EIP-7951 secp256r1 signer type `v == 2` in contracts/Safe.sol:354-396 plus new contracts/common/EIP7951.sol and new error codes GS027/GS028 (commit 0e91d99, 2026-01-14); (2) EIP-7702 self-ownership via `isThisDelegatedAccount()` in contracts/base/OwnerManager.sol:118-121 and new contracts/common/EIP7702.sol (commits 034184d 2025-07-10, 0227664 2025-12-12); (3) `SafeProxyFactory.proxyCreationCodehash` (contracts/proxies/SafeProxyFactory.sol:42-44, commit 1036b92); (4) assembly `domainSeparator` (contracts/Safe.sol:456-474, dd2454f); (5) storage-slot constants moved to contracts/libraries/SafeStorage.sol (6a71753). Keyword search of docs/Safe_Audit_Report_1_5_0_Certora.pdf and docs/Safe_Audit_Report_1_5_0_Ackee.pdf finds zero hits for 7951/7212/secp256r1/p256, and Ackee states 'The reviewed version of Safe is incompatible with EIP-7702 smart accounts', so these changes post-date both audits. CHANGELOG.md lines 8-16 ('Current version') list only the #1115 change; the whole CHANGELOG has no mention of secp256r1/EIP-7951/EIP-7702/proxyCreationCodehash, and docs/signatures.md documents only signature types 0, 1, 27-30 and >30 (the `v == 2` encoding gap is tracked separately as F09). The task brief's premise that only #1115 and #1123 landed after the audits is therefore not supported by the repository evidence. It could not be determined (public RPCs blocked by the proxy, no safe-deployments package installed) whether the deployed 1.5.0 singleton (0xFf51A5898e281Db6DfC7855790607438dF2ca44b) was built with or without these changes; `VERSION` is still \"1.5.0\" at contracts/Safe.sol:58.",
+  "attack_path": "No direct attack path. Process/coverage risk: the secp256r1 branch, EIP-7702 self-ownership logic and codehash helper are unaudited relative to docs/audit_1_5_0.md and undocumented for integrators (docs/signatures.md), so later review stages and integrators cannot rely on 'audited 1.5.0' or on the signature-encoding doc for those code paths.",
+  "evidence": "git log --format=%h %ad %s: 0e91d99 2026-01-14 Add EIP-7951 Signer Support (#1061); 0227664 2025-12-12 Prevent Self-Ownership for Non-EIP-7702 Safes (#1062); 034184d 2025-07-10 Allow Safe to Own Itself (#998); 1036b92 2025-07-11 Creation Code Hash (#1019); audited commits 1c8b24a 2025-01-23, 5d26505 2025-05-27. `git diff --stat 5d26505 HEAD -- contracts/` shows contracts/common/EIP7702.sol (+29) and contracts/common/EIP7951.sol (+48) as new files. CHANGELOG.md:8-16 is the entire 'Current version' changes section. docs/signatures.md has no secp256r1 section. pypdf keyword counts in both 1.5.0 audit PDFs: '7951': 0, 'secp256r1': 0, 'p256': 0; Ackee PDF: 'incompatible with EIP-7702'.",
+  "recommendation": "Add CHANGELOG 'Current version' entries for EIP-7951 signer support (new `v == 2` type, GS027/GS028), EIP-7702 self-ownership and `proxyCreationCodehash`; add the secp256r1 encoding to docs/signatures.md (F09); and either record a follow-up audit covering these commits in docs/ or state explicitly that docs/audit_1_5_0.md does not cover them. Later review stages should treat Safe.sol:354-396, EIP7951.sol, EIP7702.sol and OwnerManager.sol:114-144 as unaudited code, not as 'audited 1.5.0'.",
+  "confidence": 0.9,
+  "sources": [
+   "post-audit-diff"
+  ]
+ },
+ {
+  "id": "F14",
+  "title": "#1115 strict return-data semantics are not covered by tests (only the revert case is); PoC confirms documented behaviour",
+  "severity": "informational",
+  "category": "test-coverage",
+  "file": "test/core/Safe.Signatures.spec.ts",
+  "line": 1102,
+  "description": "The only tests added by #1115 are the two 'isValidSignature reverts' cases (test/core/Safe.Signatures.spec.ts:1102-1144 and test/handlers/CompatibilityFallbackHandler.spec.ts:232-281). None of the behaviours the CHANGELOG calls a breaking change (CHANGELOG.md:16: exactly 32 bytes, magic in first 4 bytes, remaining 28 bytes zero) is exercised: no test for 33-byte or 64-byte (trailing) returns, 31/4/0-byte (short) returns, dirty low bits, magic right-aligned, or an EOA/codeless address used as a `v == 0` signer. A repo-wide grep for mock validators returning crafted data (`givenMethodReturn|givenCalldataReturn|1626ba7e`) finds only full-magic returns. A PoC spec (docs/security-review/poc/post-audit-erc1271-strict-return.spec.ts, 12 passing, left uncommitted) confirms, under solc 0.7.6, that contracts/common/SecuredSignatureValidator.sol:23 accepts exactly `0x1626ba7e || 28 zero bytes` and rejects (GS024) 33/64/31/4/0-byte returns, dirty low bits and right-aligned magic; it also confirms with a legacy high-level caller compiled by the same solc that the pre-#1115 code accepted the 33-byte, 64-byte and dirty-low-bit cases, exactly as the CHANGELOG states. So the implementation is correct and the CHANGELOG is accurate, but a future refactor (e.g. relaxing `result.length == 32` to `>= 32`, or switching to ABI decoding) would not be caught by the suite.",
+  "attack_path": "None directly; regression risk only. A future change that re-enables lenient decoding would silently widen what counts as a valid contract signature without any test failing.",
+  "evidence": "Safe.Signatures.spec.ts:1102-1144 and CompatibilityFallbackHandler.spec.ts:232-281 use only `revertingSignatureValidatorContract` (test/utils/contracts.ts:86-95, `revert(\"isValidSignature reverted\")`). PoC run output: 'checkNSignatures: 33 bytes (one trailing byte) => GS024; legacy high-level call => true', '32 bytes, dirty low bits => GS024; legacy high-level call => true', '31 bytes (short) => GS024; legacy high-level call => revert', 'exactly 32 bytes, magic left-aligned => valid; legacy => true'.",
+  "recommendation": "Port the PoC cases into test/core/Safe.Signatures.spec.ts (and the CompatibilityFallbackHandler suite): 32-byte success, 33/64-byte trailing data, 31/4/0-byte short data, dirty low bits, right-aligned magic, codeless address as v==0 signer, all expecting GS024 except the exact-32 case.",
+  "confidence": 0.9,
+  "sources": [
+   "post-audit-diff"
+  ]
+ },
+ {
+  "id": "F15",
+  "title": "Contract-signature offset near 2^256 reverts with a SafeMath string instead of a GS error code",
+  "severity": "informational",
+  "category": "error-handling-consistency",
+  "file": "contracts/Safe.sol",
+  "line": 272,
+  "description": "`checkContractSignature` bounds-checks the data pointer with `offset.add(32)` (SafeMath). For an attacker-supplied pointer `s >= 2^256 - 32`, SafeMath reverts with the string `\"SafeMath: addition overflow\"` rather than `GS022`. The same applies to `offset.add(32).add(contractSignatureLen)` at line 282 and `uint256(s).add(128)` at line 368 (GS027). PR #1115 explicitly set the goal of 'consistent use of error codes across the signature validation logic' and of not letting the `signatures` bytes steer the revert data; this path still yields a non-GS revert reason driven by the signature bytes (the string is constant, so it is not attacker-controlled data, only an inconsistency). Confirmed empirically: a v=0 signature with s = 0xff..ff reverts, but not with GS022.",
+  "attack_path": "None. The revert is total and the string is constant; the only effect is that tooling matching on `GS0xx` codes sees an unexpected reason.",
+  "evidence": "contracts/Safe.sol:272 `if (offset.add(32) > signatures.length) revertWithError(\"GS022\");` ; :282 `if (offset.add(32).add(contractSignatureLen) > signatures.length) revertWithError(\"GS023\");` ; :368 `if (uint256(s).add(128) > signatures.length) revertWithError(\"GS027\");`. PoC (hardhat, 0.7.6): signature `owner || 0xff*32 || 0x00` on a 1-of-1 Safe reverts without the GS022 reason.",
+  "recommendation": "Use overflow-free comparisons, e.g. `if (offset > signatures.length || signatures.length - offset < 32) revertWithError(\"GS022\");` and analogously for GS023/GS027, so every malformed-signature path reverts with a GS code.",
+  "confidence": 0.85,
+  "sources": [
+   "core-sig"
+  ]
+ },
+ {
+  "id": "F16",
+  "title": "CI workflow lacks a least-privilege `permissions:` block and pins third-party actions to mutable major tags",
+  "severity": "informational",
+  "category": "ci-hardening",
+  "file": ".github/workflows/ci.yml",
+  "line": 2,
+  "description": "`ci.yml` triggers on `[push, pull_request]` (line 2) with no top-level or job-level `permissions:` key, so `GITHUB_TOKEN` receives the repository default (potentially read/write for older repositories). All actions are referenced by major tag (`actions/checkout@v5` lines 10/21/35/53/75, `actions/setup-node@v4` line 11, `@v6` lines 23/36/54, `@v5` line 76; `actions/setup-python@v6` certora.yml:24), not by commit SHA, so a compromised or force-moved tag would execute attacker code on the runner. The setup-node versions are also inconsistent across jobs (v4/v5/v6). No `pull_request_target` is used and `ci.yml` consumes no secrets, which bounds the impact to the ephemeral runner and whatever the token can do.",
+  "attack_path": "Supply-chain: if an upstream action tag is retargeted, the next CI run executes it with the default-permission GITHUB_TOKEN; with a write-capable default this could push or tamper with repository content/checks. Requires compromise of the actions org or tag; no direct attacker trigger from a PR (fork PRs get a read-only token).",
+  "evidence": ".github/workflows/ci.yml:2 `on: [push, pull_request]`; no `permissions:` anywhere in ci.yml or certora.yml; ci.yml:10 `uses: actions/checkout@v5`, :11 `actions/setup-node@v4`, :23 `actions/setup-node@v6`, :76 `actions/setup-node@v5`.",
+  "recommendation": "Add `permissions: { contents: read }` at workflow top-level in both workflows; pin actions to full commit SHAs (with Dependabot/Renovate to bump them); unify the setup-node version.",
+  "confidence": 0.85,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F17",
+  "title": "Error-code documentation is stale/ambiguous after post-audit changes: GS024 now covers reverts, codeless signers and bad return sizes; GS027 is reused with a different meaning than in 1.3.0",
+  "severity": "informational",
+  "category": "documentation-consistency",
+  "file": "docs/error_codes.md",
+  "line": 41,
+  "description": "(a) docs/error_codes.md:41-43 describes GS024 as 'The contract signer returned an invalid value (not EIP1271_MAGIC_VALUE)'. After #1115 (contracts/Safe.sol:295 + contracts/common/SecuredSignatureValidator.sol:22-23) GS024 is also raised when `isValidSignature` reverts (including out-of-gas in the callee), when the signer address has no code (the low-level `staticcall` has no EXTCODESIZE check, so an EOA returns success with empty data -- confirmed by PoC), and when the return data is not exactly 32 bytes. The debugging hint ('check that the contract signer ... returns the correct value') therefore misses the most common new cause (inner revert, e.g. a nested Safe's GS025/GS026 now surfaces as GS024, as test/core/Safe.Signatures.spec.ts:514-516 notes). (b) GS027 was defined in the 1.3.0 changelog (CHANGELOG.md:300) as 'dataHash must equal hash of data' for contract signatures; the post-audit EIP-7951 commit reuses GS027 at contracts/Safe.sol:368 for 'Invalid secp256r1 signature location' (docs/error_codes.md:50) without noting the reuse. Tooling or docs that map error codes across versions will mislabel one of the two.",
+  "attack_path": "None; developer/integrator confusion only (misdiagnosed signature failures, wrong error labels in cross-version tooling).",
+  "evidence": "docs/error_codes.md:41-43 (GS024 text); contracts/common/SecuredSignatureValidator.sol:22-23 (`owner.staticcall(data)`; `success && result.length == 32 && ...`); CHANGELOG.md:300 ('revert with a `GS027` error code' for data-hash mismatch, 1.3.0 section) vs contracts/Safe.sol:368 and docs/error_codes.md:50 (secp256r1 location). PoC: 'EOA used as a v=0 contract signer => GS024'.",
+  "recommendation": "Update the GS024 entry to list all triggers (revert/OOG in signer, no code at signer address, return data length != 32, value != magic) and the nested-Safe mapping; add a note to the GS027 entry (and the CHANGELOG 'Current version' section) that the code was previously used in 1.3.0 for the removed data-hash check.",
+  "confidence": 0.85,
+  "sources": [
+   "post-audit-diff"
+  ]
+ },
+ {
+  "id": "F18",
+  "title": "Dev toolchain carries known-vulnerable transitive packages (axios 0.21.4, elliptic 6.5.4 via zksync-ethers); none reach on-chain code",
+  "severity": "informational",
+  "category": "dependency-hygiene",
+  "file": "package.json",
+  "line": 71,
+  "description": "`npm audit` on the committed lockfile reports 79 advisories (4 critical, 45 high). All are devDependencies. The ones with any deploy-time footprint: `hardhat-deploy@1.0.4` (package.json:71) depends on `axios@0.21.4` (used for Etherscan API calls, node_modules/hardhat-deploy/dist/src/etherscan.js:136, 288; advisories GHSA-wf5p-g6vw-rhxx, GHSA-jr5f-v2jv-69x6) and on `zksync-ethers@5.11.0 -> ethers@5.7.2 -> @ethersproject/signing-key@5.7.0 -> elliptic@6.5.4` (GHSA-vjh7-7g9h-fjfh private-key extraction on malformed input, GHSA-977x-g7h5-7qgw). `zksync-ethers` is `require`d at module load (helpers.js:33, DeploymentFactory.js:39) but only used for `zksync: true` networks, which this config never sets (hardhat.config.ts:123-126), and transaction signing for deployments goes through Hardhat's local-accounts provider (noble secp256k1), not elliptic 6.5.4. `@openzeppelin/contracts@3.4.2` (package.json:60) is imported only by contracts/test/{ERC20Token,ERC721Token,ERC1155Token,TestImports}.sol; no production contract imports from node_modules. The lockfile itself is clean: lockfileVersion 3, every package resolved from registry.npmjs.org with an integrity hash, and CI uses `npm ci`.",
+  "attack_path": "No path to deployed bytecode. Realistic exposure is limited to the developer/CI machine (DoS/ReDoS in lint/test tooling, SSRF-class issues in axios only reachable with attacker-controlled URLs, which the etherscan task does not accept).",
+  "evidence": "package-lock.json: `node_modules/axios` 0.21.4, `node_modules/zksync-ethers/node_modules/elliptic` 6.5.4, `node_modules/elliptic` 6.6.1; `npm audit --json` metadata `{\"critical\":4,\"high\":45,\"moderate\":13,\"low\":17}`; direct packages flagged: hardhat, hardhat-deploy, @nomicfoundation/hardhat-toolbox, @openzeppelin/contracts, typescript-eslint, solc (via tmp).",
+  "recommendation": "Bump `hardhat-deploy` when a release drops axios 0.21.x / zksync-ethers 5.x (or add an `overrides` entry for `elliptic` and `axios`), keep `@openzeppelin/contracts` dev-only, and run `npm audit` in CI with an allow-list so new deploy-path advisories are noticed.",
+  "confidence": 0.8,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F19",
+  "title": "Certora workflow installs an unverified solc binary and unpinned-hash pip packages in a job that holds CERTORA_KEY",
+  "severity": "informational",
+  "category": "ci-supply-chain",
+  "file": ".github/workflows/certora.yml",
+  "line": 32,
+  "description": "The `verify` job does `wget https://github.com/ethereum/solidity/releases/download/v0.7.6/solc-static-linux` and moves it to `/usr/local/bin/solc7.6` without any checksum (certora.yml:32-34), and `pip install -r certora/requirements.txt` (line 28) with `certora-cli==7.29.2` pinned by version only (no `--require-hashes`). Both run before the step that exposes `CERTORAKEY: ${{ secrets.CERTORA_KEY }}` (line 44-45). The key is printed only as its length (`${#CERTORAKEY}`, line 42), which is fine. This job does not affect on-chain artifacts (it only feeds the Certora prover), and fork PRs do not receive the secret, so exposure is limited to a low-value prover API key via a compromised GitHub release asset or PyPI package.",
+  "attack_path": "Compromise of the pinned PyPI release (or GitHub release asset) -> arbitrary code on the runner -> read `CERTORAKEY` from the environment of the verify step. No path to repository write or to deployed bytecode.",
+  "evidence": ".github/workflows/certora.yml:28 `run: pip install -r certora/requirements.txt`; :32-34 `wget .../solc-static-linux; chmod +x ...; sudo mv ...`; :45 `CERTORAKEY: ${{ secrets.CERTORA_KEY }}`; certora/requirements.txt: `certora-cli==7.29.2`.",
+  "recommendation": "Verify the solc download (`sha256sum --check` against the published checksum), use `pip install --require-hashes` with a hash-pinned requirements file, and add `permissions: contents: read`.",
+  "confidence": 0.7,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F20",
+  "title": "ExtensibleFallbackHandler: any address can self-register as a \"Safe\"; third-party IFallbackMethod/ISafeSignatureVerifier contracts must not treat msg.sender == ExtensibleFallbackHandler (or the `sender` argument) as proof of a legitimate Safe context",
+  "severity": "informational",
+  "category": "trust-boundary / integration-footgun",
+  "file": "contracts/handler/extensible/ExtensibleBase.sol",
+  "line": 39,
+  "description": "`onlySelf` (ExtensibleBase.sol:39) only requires `_msgSender() == _manager()`, i.e. that the last 20 bytes of calldata equal `msg.sender`. When the handler is called directly (not through a Safe's FallbackManager), any EOA/contract can append its own address and pass the check, so `setSafeMethod` (FallbackHandler.sol:24-26), `setDomainVerifier` (SignatureVerifierMuxer.sol:79-84) and `setSupportedInterface`/`add|removeSupportedInterfaceBatch` (ERC165Handler.sol:34-85) succeed with the caller's own address as the storage key. The caller can then invoke `FallbackHandler.fallback` (FallbackHandler.sol:31-41) directly with an arbitrary trailing 20 bytes, and the registered custom handler receives `handle(safe = attacker, sender = <attacker-chosen>, 0, data)` with `msg.sender == ExtensibleFallbackHandler`. Likewise `SignatureVerifierMuxer.isValidSignature` (SignatureVerifierMuxer.sol:93-139) will call `verifier.isValidSafeSignature(safe = attacker, sender = <attacker-chosen>, ...)` for a verifier the attacker registered under their own key. The Safe itself is not affected (all state is keyed by `msg.sender`, and a Safe's entries can only be written when the Safe is `msg.sender` and the appended caller is the Safe, which only Safe transactions/modules can produce), but the ISafeSignatureVerifier docs (SignatureVerifierMuxer.sol:17-29) and IFallbackMethod interface (ExtensibleBase.sol:8-14) do not warn that `safe` may be an arbitrary non-Safe address and that `sender` is attacker-controlled in that case. Distinct from F24 (spoofing a legacy <1.3.0 Safe's own entries) and F26 (stale per-Safe configuration).",
+  "attack_path": "1) Attacker A sends tx to ExtensibleFallbackHandler with data = setSafeMethod(sel, encode(false, H)) || A (20 bytes). onlySelf passes because last-20-bytes == msg.sender == A; safeMethods[A][sel] = H. 2) A sends tx to ExtensibleFallbackHandler with data = sel || X (any 20 bytes). fallback() calls H.handle(safe=A, sender=X, 0, sel) with msg.sender == ExtensibleFallbackHandler. 3) If H (a third-party handler shared by many Safes) has any logic that trusts `msg.sender == EFH` as proof that `safe` is a configured Safe, or trusts `sender` globally (e.g. 'privileged address X interacted'), it is misled. Victim Safes' own safeMethods/domainVerifiers entries are untouched (verified).",
+  "evidence": "PoC run in this session (hardhat, 0.7.6): after a direct call `setSafeMethod(0xdeadbeef, encode(false, Recorder)) || attacker`, `efh.safeMethods(attacker, sel) == encoded` while `efh.safeMethods(victimSafe, sel) == 0x0`; calling victimSafe with `0xdeadbeef` reverts 'method handler not set'; a direct call `0xdeadbeef || 0x1111\u20261111` made Recorder observe `lastMsgSender == EFH`, `lastSafe == attacker`, `lastSender == 0x1111\u20261111`. Same for `setDomainVerifier`: `domainVerifiers(attacker, d) == Recorder`, `domainVerifiers(victimSafe, d) == 0`. Code: ExtensibleBase.sol:35-41 (onlySelf), HandlerContext.sol:47-56 (_msgSender reads last 20 bytes), HandlerContext.sol:62-64 (_manager = msg.sender), FallbackHandler.sol:31-41.",
+  "recommendation": "Document in IFallbackMethod/IStaticFallbackMethod and ISafeSignatureVerifier natspec that `safe` is simply the `msg.sender` of the ExtensibleFallbackHandler and may be any address (not necessarily a Safe), and that `sender` is only trustworthy when `safe` is a >=1.3.0 Safe. Third-party handlers/verifiers should key all state by `safe` and never use `msg.sender == ExtensibleFallbackHandler` as an authorization signal on its own. Optionally, `onlySelf` could additionally require `_requireFallback()`-style evidence (msg.sender.getStorageAt(FALLBACK_HANDLER_STORAGE_SLOT) == address(this)), which would reject direct self-registration by non-Safes, though that is a behavior change.",
+  "confidence": 0.6,
+  "sources": [
+   "handlers"
+  ]
+ },
+ {
+  "id": "F21",
+  "title": "Publicly-known default mnemonic is silently used as the deployer for live networks when MNEMONIC/PK are unset",
+  "severity": "informational",
+  "category": "key-management",
+  "file": "hardhat.config.ts",
+  "line": 58,
+  "description": "`DEFAULT_MNEMONIC = \"candy maple cake sugar pudding cream honey rich smooth crumble sweet treat\"` (hardhat.config.ts:58) is the well-known Truffle/Ganache phrase (account 0 = 0x627306090abaB3A6e1400e9345bC60c78a8BEf57). It is used as `sharedNetworkConfig.accounts` for every live network (mainnet, sepolia, gnosis, zksync, custom; lines 62-68, 111-134) whenever `MNEMONIC` and `PK` are both unset. The only pre-flight guard (line 54-56) checks `INFURA_KEY` for `mainnet`/`sepolia`; `gnosis`, `zksync` and `custom` have no guard at all. Because deployments are deterministic (CREATE2 through the singleton factory), the deployer key does not influence addresses, so the consequence is limited to (a) confusing 'insufficient funds' failures and (b) loss of any funds an operator sends to that address to make the deployment go through (keys for this phrase are swept by bots).",
+  "attack_path": "Operator runs `npm run deploy-all gnosis` without a `.env`; hardhat signs with the public key 0x6273...; the tx fails for lack of gas; the operator funds 0x6273... to retry and the funds are swept by anyone watching the well-known key. No path to a wrong singleton address.",
+  "evidence": "hardhat.config.ts:54 `if ([\"mainnet\", \"sepolia\"].includes(argv.network) && INFURA_KEY === undefined) throw ...` (no mnemonic check, no check for gnosis/zksync/custom); :65-67 `accounts: { mnemonic: MNEMONIC ?? DEFAULT_MNEMONIC }`.",
+  "recommendation": "Throw when `argv.network !== \"hardhat\"` and neither `MNEMONIC` nor `PK` is set (or restrict `DEFAULT_MNEMONIC` to the `hardhat` network config only).",
+  "confidence": 0.6,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F22",
+  "title": "`local-verify`/`yulcode` execute a remotely fetched solc-js build with no integrity verification (unlike Hardhat's own downloader)",
+  "severity": "informational",
+  "category": "supply-chain",
+  "file": "src/utils/solc.ts",
+  "line": 13,
+  "description": "`loadSolc` calls `solc.loadRemoteVersion(\"v\" + version, ...)` (src/utils/solc.ts:13). In the installed solc-js 0.7.6 this does a plain `https.get('https://solc-bin.ethereum.org/bin/soljson-<ver>.js')` and immediately executes the body via `requireFromString` (node_modules/solc/wrapper.js:329-339) with no keccak/list.json check and no redirect handling. Hardhat's compiler downloader, by contrast, verifies the build against `list.json` keccak256 (node_modules/hardhat/internal/solidity/compiler/downloader.js:136, 211-217). `loadSolc` runs on the operator machine during `deploy-contracts` (local-verify) where `MNEMONIC`/`PK` are in the environment. The version string comes from the deployment metadata (local_verify.ts:10), not from user input.",
+  "attack_path": "Requires a compromise of the solc-bin origin/CDN or an active TLS MITM against the deployer machine: the fetched JS runs in the deployer's Node process and could read `process.env.MNEMONIC`/`PK`. Hardhat's path trusts the same origin, so the incremental exposure is the missing per-file hash check.",
+  "evidence": "src/utils/solc.ts:13 `solc.loadRemoteVersion(`v${version}`, ...)`; node_modules/solc/wrapper.js:331 `var url = 'https://solc-bin.ethereum.org/bin/soljson-' + versionString + '.js';` and :338 `setupMethods(requireFromString(mem.toString(), ...))`.",
+  "recommendation": "Reuse Hardhat's verified compiler (e.g. `hre.run(TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD, { solcVersion })` and load `compilerPath`) or verify the downloaded file against `list.json` keccak256 before executing it.",
+  "confidence": 0.6,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F23",
+  "title": "setup() native-token deployment payment silently becomes 0 when tx.gasprice == 0 (handlePayment caps gasPrice=1 by tx.gasprice)",
+  "severity": "informational",
+  "category": "correctness / payment-bypass on zero-gas-price networks",
+  "file": "contracts/Safe.sol",
+  "line": 132,
+  "description": "setup() reuses handlePayment with `gasUsed=payment, baseGas=0, gasPrice=1` and the comment at Safe.sol:130-131 asserts `amount = (payment + 0) * 1 = payment`. However, for `paymentToken == address(0)` handlePayment computes `payment = gasUsed.add(baseGas).mul(gasPrice < tx.gasprice ? gasPrice : tx.gasprice)` (Safe.sol:252), i.e. `payment * min(1, tx.gasprice)`. Whenever the deployment transaction has `tx.gasprice == 0` (zero-fee / private chains, local dev nodes, chains or bundles that accept 0-priced txs), the multiplier is 0: no native token is sent, no revert occurs, and setup completes as if paid. The ERC-20 `paymentToken` path (Safe.sol:256) is not capped and behaves as documented, so the two paths are inconsistent. The Certora refund spec explicitly works around this (certora/specs/NativeTokenRefund.spec: `hook GASPRICE uint v { require v > 0; ... }` with the comment 'We need to make sure that the gas price is not zero'), confirming the zero-gas-price case is known for execTransaction but it is not documented for setup, where the stated invariant is `amount = payment`. In the common case (paymentReceiver == 0 -> tx.origin == the deployer/relayer) the deployer only short-changes itself; it only matters when `paymentReceiver` is a third party that is owed the native-token `payment` (e.g. a deployment fee/escrow collected via setup).",
+  "attack_path": "On a network where transactions with tx.gasprice == 0 are mined (or any environment where the deployer controls tx.gasprice and 0 is accepted), a user deploys a Safe via SafeProxyFactory with initializer `setup(..., paymentToken=0, payment=X, paymentReceiver=<third party>)`. handlePayment computes X * min(1, 0) = 0, sends 0 wei to the receiver (call succeeds), and setup completes with the Safe fully configured while the receiver never gets X. No revert, no event discrepancy (SafeSetup omits refund info). On ordinary EIP-1559 chains tx.gasprice >= baseFee > 0, so this is not reachable there.",
+  "evidence": "Safe.sol:129-133: `if (payment > 0) { ... handlePayment(payment, 0, 1, paymentToken, paymentReceiver); }` with comment `amount = (payment + 0) * 1 = payment`.  Safe.sol:250-254: `if (gasToken == address(0)) { payment = gasUsed.add(baseGas).mul(gasPrice < tx.gasprice ? gasPrice : tx.gasprice); (bool refundSuccess, ) = receiver.call{value: payment}(\"\"); if (!refundSuccess) revertWithError(\"GS011\"); }`.  Safe.sol:256: token path `payment = gasUsed.add(baseGas).mul(gasPrice);` (uncapped).  certora/specs/NativeTokenRefund.spec lines 11-19: GASPRICE hook requiring v > 0 'because ... it'll come up with counterexamples'. Tests in test/core/Safe.Setup.spec.ts:343-400 only run with hardhat's default non-zero gas price.",
+  "recommendation": "Either document that the native-token setup payment (and execTransaction native refunds) is multiplied by min(gasPrice, tx.gasprice) and is therefore 0 on zero-gas-price transactions, or, if code size allows, have setup() bypass the cap (e.g. an internal `payNative(receiver, amount)` used by both paths, with the tx.gasprice cap applied only in execTransaction). Add a test with `gasPrice: 0` (hardhat `initialBaseFeePerGas: 0`) documenting the chosen behaviour.",
+  "confidence": 0.5,
+  "sources": [
+   "gas-refund"
+  ]
+ },
+ {
+  "id": "F24",
+  "title": "HandlerContext/ExtensibleFallbackHandler `onlySelf` is fully spoofable if the handler is installed on a pre-1.3.0 Safe (FallbackManager that does not append the caller), enabling arbitrary domain-verifier installation and ERC-1271 signature forgery for that Safe",
+  "severity": "informational",
+  "category": "documented-limitation / version-compatibility",
+  "file": "contracts/handler/HandlerContext.sol",
+  "line": 53,
+  "description": "`_msgSender()` (HandlerContext.sol:47-56) returns the last 20 bytes of calldata and is only meaningful when `msg.sender` is a FallbackManager that appends `caller()` (FallbackManager.sol:70-78, introduced in 1.3.0). Safe 1.1.1/1.2.0 `FallbackManager` forwards calldata verbatim. `onlySelf` (ExtensibleBase.sol:39) compares `_msgSender()` with `msg.sender`; behind a legacy Safe, any external caller can satisfy it by appending the Safe's own address. This is acknowledged in natspec (HandlerContext.sol:41-44 'only reliable with a FallbackManager supporting this (e.g. Safe contract >=1.3.0)'; ExtensibleFallbackHandler.sol:143 'Designed to be used with Safe >= 1.3.0') but the concrete consequence, full ERC-1271 forgery via `setDomainVerifier`, is not spelled out, and nothing in the handler prevents a legacy Safe from calling `setFallbackHandler(EFH)` (1.1.1 already has setFallbackHandler). Not reproducible in this repo (no pre-1.3.0 artifacts), so reported as informational. Distinct from F20 (direct self-registration by non-Safes, which cannot touch a real Safe's entries).",
+  "attack_path": "Precondition: a Safe < 1.3.0 (fallback forwards calldata without appending caller) has set ExtensibleFallbackHandler as its fallback handler. 1) Attacker calls legacySafe with data = setDomainVerifier(D, EvilVerifier) || legacySafe (20 bytes). legacySafe forwards unchanged to EFH; msg.sender == legacySafe, _msgSender() == legacySafe -> onlySelf passes; domainVerifiers[legacySafe][D] = EvilVerifier (SignatureVerifierMuxer.sol:79-84). 2) For any EIP-712 domain D used by a protocol the Safe interacts with (e.g. Permit2, Seaport, CoW), attacker builds a signature `0x5fd7e97d || D || typeHash || encodeData || payload` whose _hash matches; isValidSignature (SignatureVerifierMuxer.sol:107-132) routes to EvilVerifier which returns the magic value -> protocol accepts a forged Safe signature and moves the Safe's approved assets. Same spoof lets the attacker install non-static custom methods via setSafeMethod.",
+  "evidence": "HandlerContext.sol:47-56 (_msgSender reads calldata tail with no trusted-forwarder check), ExtensibleBase.sol:35-41 (onlySelf), SignatureVerifierMuxer.sol:79-84 and 107-132 (verifier selection by attacker-supplied domainSeparator from the authorized mapping), FallbackManager.sol:70-78 (1.5.0 appends caller; legacy versions did not). Natspec acknowledgements at HandlerContext.sol:41-44 and ExtensibleFallbackHandler.sol:143.",
+  "recommendation": "Make the >=1.3.0 requirement enforceable rather than advisory, e.g. have `onlySelf` additionally call `_requireFallback()` (HandlerContext.sol:33-37), which on a legacy Safe without getStorageAt reverts and on a 1.3.0+ Safe passes; or at minimum expand the ExtensibleFallbackHandler/HandlerContext natspec to state that installing it on a Safe whose FallbackManager does not append the caller allows anyone to configure methods and verifiers and therefore forge ERC-1271 signatures.",
+  "confidence": 0.5,
+  "sources": [
+   "handlers"
+  ]
+ },
+ {
+  "id": "F25",
+  "title": "SignMessageLib NatSpec describes a verification path (pre-image + empty signature) that no longer exists; only abi.encode(bytes32)-shaped messages are verifiable via ERC-1271",
+  "severity": "informational",
+  "category": "documentation",
+  "file": "contracts/libraries/SignMessageLib.sol",
+  "line": 27,
+  "description": "SignMessageLib.sol:27 states the on-chain signed message \"Can be verified using EIP-1271 validation method by passing the pre-image of the message hash and empty bytes as the signature\". Since 1.4.0 (CHANGELOG.md:107-111) the legacy `isValidSignature(bytes,bytes)` was removed; the only ERC-1271 entry point is `CompatibilityFallbackHandler.isValidSignature(bytes32 _dataHash, bytes _signature)` (CompatibilityFallbackHandler.sol:73-86), which hashes `encodeMessageDataForSafe(safe, abi.encode(_dataHash))` (line 76). Therefore `signMessage(_data)` (SignMessageLib.sol:30-34, hash = SafeMessage{message:_data}) is only verifiable on-chain if `_data` is exactly the 32-byte `_dataHash`; an arbitrary pre-image signed per the NatSpec can never be verified (`Hash not approved`). Confirmed by PoC docs/security-review/poc/replay-lens.spec.ts (\"SignMessageLib: only abi.encode(hash)-shaped messages are verifiable\"). This fails closed and has no exploit path, but misleads integrators and the ExtensibleFallbackHandler default path (SignatureVerifierMuxer.sol:147-153) has the same 32-byte wrapping.",
+  "attack_path": "None (fails closed). An integrator following the NatSpec would mark a non-32-byte pre-image as signed and later find ERC-1271 verification impossible, a liveness/UX issue only.",
+  "evidence": "SignMessageLib.sol:27 `@dev Can be verified using EIP-1271 validation method by passing the pre-image of the message hash and empty bytes as the signature.` vs CompatibilityFallbackHandler.sol:76 `bytes memory messageData = encodeMessageDataForSafe(safe, abi.encode(_dataHash));` and :78-79 `if (_signature.length == 0) { require(safe.signedMessages(messageHash) != 0, \"Hash not approved\"); }`.",
+  "recommendation": "Update the NatSpec to say the message must be the ABI-encoded 32-byte hash that will later be passed to `isValidSignature(bytes32,bytes)` (i.e. `signMessage(abi.encode(hash))`), and cross-reference `CompatibilityFallbackHandler.getMessageHash`.",
+  "confidence": 0.5,
+  "sources": [
+   "cross-cutting-replay"
+  ]
+ },
+ {
+  "id": "F26",
+  "title": "Per-Safe ExtensibleFallbackHandler configuration (safeMethods, domainVerifiers, safeInterfaces) lives in the shared handler's storage, survives fallback-handler and owner changes, and is not enumerable on-chain",
+  "severity": "informational",
+  "category": "stale-state / backdoor-persistence",
+  "file": "contracts/handler/extensible/SignatureVerifierMuxer.sol",
+  "line": 64,
+  "description": "`domainVerifiers` (SignatureVerifierMuxer.sol:64), `safeMethods` (ExtensibleBase.sol:32) and `safeInterfaces` (ERC165Handler.sol:25) are keyed by Safe address in the singleton handler. Switching the Safe's fallback handler away from EFH (FallbackManager.sol:46-49) does not clear them, and switching back re-activates them instantly. Unlike modules (`getModulesPaginated`) or the guard/handler slots (`getStorageAt`), there is no on-chain enumeration; discovery requires scanning `ChangedDomainVerifier`/`ChangedSafeMethod` events. A domain verifier is an ERC-1271 signing oracle for one EIP-712 domain, so a stale entry is a signature backdoor.",
+  "attack_path": "1) While in control, a (later-rotated) owner set executes setDomainVerifier(D_permit2, EvilVerifier) through the Safe. 2) Ownership is transferred (swapOwner/addOwner/removeOwner); new owners audit owners, threshold, modules, guard and fallback handler (canonical EFH) and see nothing wrong. 3) Old owner later presents `0x5fd7e97d || D_permit2 || \u2026` signatures to Permit2; SignatureVerifierMuxer.isValidSignature routes to EvilVerifier (SignatureVerifierMuxer.sol:123-131) and the Safe's ERC-20 allowances are drained. Same if the Safe temporarily moved to CompatibilityFallbackHandler and later back to EFH: the old verifier/methods are live again with no event at re-enable time.",
+  "evidence": "SignatureVerifierMuxer.sol:64, 79-84 (mapping keyed by Safe; only setter is setDomainVerifier, never cleared on handler change); ExtensibleBase.sol:32, 45-60; ERC165Handler.sol:25; FallbackManager.sol:19-49 (setFallbackHandler only writes the slot). No enumeration function exists in any in-scope file (only public mapping getters).",
+  "recommendation": "Document that operators must audit `ChangedDomainVerifier`/`ChangedSafeMethod` events (or the mapping getters for known domains) on ownership transfer or when re-enabling the EFH. Consider adding an on-chain enumerable structure or a `clearConfiguration()`-style `onlySelf` helper so a Safe can atomically wipe all handler state, and/or emitting a configuration-version event.",
+  "confidence": 0.45,
+  "sources": [
+   "handlers"
+  ]
+ },
+ {
+  "id": "F27",
+  "title": "Fork-only compiler escape hatch bypasses Hardhat's compiler integrity check and hard-codes the solc long version",
+  "severity": "informational",
+  "category": "build-integrity",
+  "file": "hardhat.config.ts",
+  "line": 19,
+  "description": "Commit 75e7ea7 (not upstream; part of the audit scaffolding in this fork) registers a `TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD` subtask that, when `AUDIT_LOCAL_SOLC=1`, returns `require.resolve(\"solc/soljson.js\")` with a hard-coded `longVersion: \"0.7.6+commit.7338295f\"` (hardhat.config.ts:19-27). This skips Hardhat's keccak256 verification of compiler builds and trusts the npm `solc` package instead (lockfile-pinned `solc@=0.7.6` with integrity). The untracked `.env` in this checkout enables it. Verified empirically that this compiler is byte-identical in output to the official build for this code base: compiling the v1.5.0 commit with it reproduces all 13 CHANGELOG 1.5.0 CREATE2 addresses. It is therefore safe for this audit environment, but it should not be merged upstream or used for a production `deploy-all`, since `longVersion` is asserted rather than derived and any future drift of the npm `solc` pin would be silently mislabelled in build-info/metadata.",
+  "attack_path": "None in this environment (verified equivalence). If carried into a deployment environment with `AUDIT_LOCAL_SOLC=1` and a different npm `solc` version installed, build-info/deployment metadata would claim 0.7.6+commit.7338295f while bytecode came from another compiler, defeating later source verification.",
+  "evidence": "hardhat.config.ts:19-29 (subtask returning `compilerPath: require.resolve(\"solc/soljson.js\"), isSolcJs: true, version: \"0.7.6\", longVersion: \"0.7.6+commit.7338295f\"`); `.env` (untracked) contains `AUDIT_LOCAL_SOLC=1`; rebuild of dc437e8 with this compiler -> Safe 0xFf51A5898e..., MultiSend 0x2185432880..., all MATCH CHANGELOG.md:29-61.",
+  "recommendation": "Keep this out of upstream; if retained locally, derive `longVersion` from `require(\"solc\").version()` and assert it equals `0.7.6+commit.7338295f`, and refuse `AUDIT_LOCAL_SOLC` when `--network` is not `hardhat`.",
+  "confidence": 0.4,
+  "sources": [
+   "devops-supplychain"
+  ]
+ },
+ {
+  "id": "F28",
+  "title": "MultiSend / MultiSendCallOnly remap `to == address(0)` to `address(this)`: a semantic divergence from <=1.4.1 that MultiSend-aware guards and decoders must account for",
+  "severity": "informational",
+  "category": "design/integration",
+  "file": "contracts/libraries/MultiSend.sol",
+  "line": 54,
+  "description": "Both batch libraries now execute `to := or(to, mul(iszero(to), address()))` (MultiSend.sol:54, MultiSendCallOnly.sol:45), so an entry with `to = 0x0` becomes a CALL to the Safe itself (msg.sender == Safe, which satisfies `SelfAuthorized.requireSelfCall` at contracts/common/SelfAuthorized.sol:16), e.g. `addOwnerWithThreshold`, `enableModule`, `setGuard`, `setFallbackHandler`. In 1.3.0/1.4.1 the same bytes meant a CALL to the zero address (an ETH burn / no-op). The code was present at both 1.5.0 audited commits (verified by fetching 1c8b24a0 and 5d265053: line 50 in each) and is tested ('forwards the call to self when to is zero address'), so it is accepted design. The reason it is worth recording: the encoding is otherwise byte-compatible with the 1.3.0/1.4.1 libraries (MultiSendCallOnly.sol:14-15 explicitly advertises compatibility), and nothing in CHANGELOG.md for 1.5.0 mentions the change (grep for the self-default returns only the 1.3.0 payable note at CHANGELOG.md:703). Third-party components that decode `multiSend` payloads with the old semantics, in particular transaction guards or Roles-style modifiers that implement a *deny* rule such as 'no batch entry may target the Safe itself' by comparing `to != address(safe)`, will treat a `to = 0x0` entry as harmless while on-chain it executes a privileged self-call.",
+  "attack_path": "Requires a quorum of owners (the batch is signed) plus an external guard/decoder that enforces restrictions on owners using the 1.4.1 interpretation of `to`. Owners sign a MultiSend batch containing `[op=0][to=0x00..00][value=0][len][addOwnerWithThreshold(attacker,1)]`; a guard that decodes the batch and denies entries with `to == safe` lets it through because it sees `to == 0x0`; MultiSend remaps it and the Safe adds the owner. No in-repo guard (contracts/examples/guards/*) decodes MultiSend, so there is no exploitable instance in this repository.",
+  "evidence": "contracts/libraries/MultiSend.sol:52-54 and contracts/libraries/MultiSendCallOnly.sol:43-45 (`to := or(to, mul(iszero(to), address()))`); test/libraries/MultiSend.spec.ts:316-348 and MultiSendCallOnly.spec.ts:241-273 show the intended self-call; upstream commits 1c8b24a0a438e8c2cd089a9d830d1688a47a28d5 and 5d26505388e9ee014ad9ac497aa48e3a13426eb1 both contain the line (audited).",
+  "recommendation": "Document the `to == 0 => address(this)` rule prominently in the 1.5.0 CHANGELOG/NatSpec and in integration guidance for guard/decoder authors (treat `to == 0` as `to == safe` when evaluating policies). The guards lens should check any MultiSend-aware policy code for this case.",
+  "confidence": 0.3,
+  "sources": [
+   "libraries"
+  ]
+ }
+]
